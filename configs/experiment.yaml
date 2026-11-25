@@ -1,0 +1,127 @@
+# ============================================================================
+# RoadVision-PDC — experiment configuration
+# ----------------------------------------------------------------------------
+# One config drives BOTH CPU and GPU runs. The device is selected at runtime
+# (CLI arg / notebook cell) and written into the results record; nothing in
+# the model/optimizer/data pipeline may depend on the device, so that
+# Experiment D (Colab CPU vs Colab GPU, same runtime) is a controlled
+# comparison.
+# ============================================================================
+
+project:
+  name: RoadVision-PDC
+  title: "CPU-GPU Accelerated Road Damage Detection Using Deep Learning"
+  course: "CS09645|11 Parallel & Distributed Computing"
+  instructor: Nayab Gull
+
+# ----------------------------------------------------------------------------
+# Reproducibility
+# ----------------------------------------------------------------------------
+seed: 42
+
+# ----------------------------------------------------------------------------
+# Dataset gate — MUST stay false until docs/DATASET_APPROVAL.md records
+# instructor approval. The downloader checks this flag AND the
+# DATASET_APPROVED environment variable (either one true is not enough:
+# the downloader requires an explicit opt-in; see data/download.py).
+# ----------------------------------------------------------------------------
+dataset:
+  approved: false            # DATASET_APPROVED gate (keep false)
+  name: RDD2022
+  root: data/raw
+  processed_dir: data/processed
+  # Proposed country subset — PENDING instructor approval (see
+  # docs/DATASET_APPROVAL.md). Sizes are approximate, from the official
+  # sekilab/RoadDamageDetector README.
+  countries:
+    - Czech                  # RDD2022_Czech.zip   ~245.2 MB
+    - India                  # RDD2022_India.zip   ~502.3 MB
+    - Japan                  # RDD2022_Japan.zip   ~1022.9 MB
+  # Annotated training images are split into train/validation at the
+  # IMAGE level (deterministic, seeded). The official RDD2022 *test*
+  # images ship WITHOUT ground-truth annotations and are therefore never
+  # used for metric computation in this project.
+  split:
+    seed: 42
+    train_fraction: 0.8
+    val_fraction: 0.2
+    # Recorded into results at split time: seed, per-split image counts,
+    # per-country distribution (see data/dataset.py make_splits()).
+  # Class mapping: background is implicit index 0 for SSD-family heads.
+  classes: [D00, D10, D20, D40]
+  class_to_idx: {D00: 1, D10: 2, D20: 3, D40: 4}
+
+# ----------------------------------------------------------------------------
+# Image preprocessing (identical across all experiments)
+# ----------------------------------------------------------------------------
+preprocessing:
+  # SSDLite320 expects 320x320 inputs. Original images are RGB JPEGs of
+  # varying sizes; we resize to (320, 320) and scale boxes accordingly.
+  resize: [320, 320]
+  normalize_mean: [0.485, 0.456, 0.406]   # ImageNet stats (backbone pretrained)
+  normalize_std: [0.229, 0.224, 0.225]
+  to_tensor: true
+  # Minimal augmentation for v1 — keep identical across devices.
+  hflip_prob: 0.5
+
+# ----------------------------------------------------------------------------
+# Model (INITIAL CANDIDATE — not permanently frozen; see
+# docs/EXPERIMENT_DESIGN.md "Model feasibility" for the synthetic CPU
+# feasibility test that must pass before finalization)
+# ----------------------------------------------------------------------------
+model:
+  name: ssdlite320_mobilenet_v3_large
+  num_classes: 5             # 4 damage classes + background (torchvision convention)
+  weights: null              # full COCO detection weights are incompatible with 5 classes
+  weights_backbone: IMAGENET1K_V1   # ImageNet-pretrained MobileNetV3-Large backbone
+  trainable_backbone_layers: 6
+
+# ----------------------------------------------------------------------------
+# Optimizer / schedule (identical across all experiments)
+# ----------------------------------------------------------------------------
+training:
+  optimizer: sgd
+  lr: 0.005
+  momentum: 0.9
+  weight_decay: 0.0005
+  lr_scheduler: steplr
+  lr_step_size: 8
+  lr_gamma: 0.1
+  epochs: 10                # pilot default; override per experiment
+  batch_size: 8             # primary comparison batch size (see experiments B)
+  grad_clip_norm: null      # null = disabled
+
+# ----------------------------------------------------------------------------
+# Data loader (identical across all experiments)
+# ----------------------------------------------------------------------------
+dataloader:
+  num_workers: 2            # Windows: keep >0 only if it proves stable; set 0 if it hangs
+  pin_memory: true          # effective only on CUDA; ignored on CPU
+  persistent_workers: false
+
+# ----------------------------------------------------------------------------
+# Device — selected at RUNTIME, never hard-coded in library code.
+#   device: cpu | cuda
+# The same config file serves every experiment; only `device` differs.
+# ----------------------------------------------------------------------------
+device: cpu
+
+# ----------------------------------------------------------------------------
+# Checkpointing / logging
+# ----------------------------------------------------------------------------
+checkpoint_dir: checkpoints
+log_dir: logs
+results_dir: results
+
+# ----------------------------------------------------------------------------
+# Benchmarking protocol (see docs/EXPERIMENT_DESIGN.md)
+# ----------------------------------------------------------------------------
+benchmark:
+  warmup_iterations: 3      # excluded from all reported statistics
+  repeat_runs: 5            # report mean + std over these runs
+  synchronize_cuda: true    # torch.cuda.synchronize() around GPU timers
+  # Timing buckets are measured so they do NOT double-count:
+  #   data_loading  — time inside the DataLoader iterator (CPU)
+  #   transfer      — host->device copy only (GPU runs; 0 on CPU)
+  #   compute       — forward+backward+step with device idle-wait
+  #   end_to_end    — wall clock of the full epoch (includes all of the above)

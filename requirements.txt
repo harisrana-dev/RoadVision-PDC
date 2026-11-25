@@ -1,0 +1,32 @@
+# RoadVision-PDC local development dependencies (CPU-only laptop).
+#
+# PyTorch / Torchvision are pinned to the officially compatible pair
+# torch 2.7.1 <-> torchvision 0.22.1 and MUST be installed from the
+# CPU wheel index first (see README.md) so no CUDA packages land on the
+# laptop:
+#
+#   pip install torch==2.7.1 torchvision==0.22.1 --index-url https://download.pytorch.org/whl/cpu
+#
+# The lines below are intentionally commented out to prevent `pip install
+# -r requirements.txt` from silently pulling default (CUDA-enabled)
+# wheels from PyPI.
+#
+# torch==2.7.1+cpu
+# torchvision==0.22.1+cpu
+
+numpy>=1.26,<3
+pandas>=2.0
+Pillow>=10.0
+matplotlib>=3.8
+seaborn>=0.13
+PyYAML>=6.0
+tqdm>=4.66
+opencv-python-headless>=4.9
+pycocotools>=2.0.9; platform_system == "Windows" or platform_system == "Linux"
+psutil>=5.9
+jupyter>=1.0
+ipykernel>=6.29
+
+# Development / quality
+pytest>=8.0
+ruff>=0.6

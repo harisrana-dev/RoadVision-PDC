@@ -1,0 +1,21 @@
+# RoadVision-PDC — Google Colab dependencies.
+#
+# Colab ships its own torch/torchvision build (CPU or GPU depending on the
+# runtime). We deliberately do NOT pin torch/torchvision here so Colab's
+# preinstalled (CUDA-enabled) wheels are kept. If a fresh install is ever
+# needed in Colab, install the matching pair for the runtime's CUDA version
+# from https://pytorch.org/get-started/locally/ instead of pinning blindly.
+#
+# Usage in a Colab notebook:
+#   !pip install -q -r requirements-colab.txt
+
+numpy>=1.26,<3
+pandas>=2.0
+Pillow>=10.0
+matplotlib>=3.8
+seaborn>=0.13
+PyYAML>=6.0
+tqdm>=4.66
+opencv-python-headless>=4.9
+pycocotools>=2.0.9
+psutil>=5.9
