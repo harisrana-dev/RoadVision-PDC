@@ -17,15 +17,18 @@ else must be labeled clearly (e.g., "exploratory, not protocol-compliant").
 
 ### Experiment D — controlled comparison rules
 
-Everything except the device must be byte-identical:
+Everything except the device must be identical — same *bytes* for the
+config, the initial-weight snapshot and the data lists (see §1.1 for the
+reproducibility level actually guaranteed):
 
-- same model architecture and **identical initial model weights**
-  (same seed → same initialization; optionally save the initial state_dict
-  once and reload it for the second device),
+- same model architecture and **identical initial model weights** obtained
+  via the mandatory procedure in §1.1 (snapshot once → hash → reload the
+  same snapshot into every device run),
 - same dataset split (seed 42, same image lists),
 - same preprocessing and augmentations (same RNG seeds),
 - same batch size, optimizer, learning rate, scheduler, epochs,
-- same DataLoader settings (`num_workers`, `pin_memory`),
+- same DataLoader settings (`num_workers`, `pin_memory`, shuffle order —
+  §2),
 - same evaluation protocol.
 
 Recorded per device: hardware inventory, PyTorch/Torchvision/CUDA versions,
@@ -34,6 +37,28 @@ from §3.
 
 **Hardware differences in A, B, C must be stated explicitly** in every
 table/figure produced from them — they are *not* interchangeable with D.
+
+### §1.1 Identical-initial-state procedure (mandatory for D)
+
+Implemented by `src/roadvision/benchmarks/protocol.py`
+(`snapshot_run_state` / `restore_run_state` / `state_dict_hash`):
+
+1. `seed_everything(seed)`; build the model (backbone/head init as
+   configured), optimizer, scheduler exactly as the config specifies.
+2. **Before any warm-up or training**, take `snapshot_run_state(model,
+   optimizer, scheduler)` — model weights, optimizer state, scheduler state
+   and all RNG states, cloned to CPU so the identical bytes serve both the
+   CPU and the GPU run.
+3. Record in the run manifest: `config_hash` (`roadvision.config.config_hash`)
+   and `weight_hash` (`protocol.state_dict_hash`) — both must match across
+   every run being compared.
+4. For each device run × each repeat: `restore_run_state(snapshot)` →
+   warm-up (§4) → `restore_run_state(snapshot)` again → measured unit.
+5. **Reproducibility level (honest):** initial weights are byte-identical
+   across runs by construction (same snapshot + hashes recorded). Training
+   trajectories are deterministic on CPU with fixed seeds and data order,
+   but GPU kernels may be nondeterministic — we report mean ± std over
+   repeats and **never claim byte-identical GPU results**.
 
 ---
 
@@ -52,6 +77,9 @@ table/figure produced from them — they are *not* interchangeable with D.
 | Scheduler | StepLR(step=8, γ=0.1) |
 | Epochs | pilot: 1–2; full: 10 (config `training.epochs`) |
 | Seed | 42 everywhere (torch, numpy, python, dataloader generator) |
+| DataLoader order | `shuffle=True` with a dedicated `torch.Generator(seed)` per run; same split-manifest image list (never rely on default global RNG for order) |
+| Measured unit | one training epoch over the measured subset (pilots: fixed `max_batches` window) — same unit for every sample in a table |
+| Initial state | snapshot + weight/config hashes per §1.1 before every device run × repeat |
 
 ---
 
@@ -66,8 +94,12 @@ For every timed configuration report:
 3. **Speedup** — `CPU elapsed time / GPU elapsed time` for otherwise
    identical runs (Experiment D primary; A/B/C only with a hardware
    disclaimer).
-4. **CPU peak RSS** — via `psutil` sampling of the process (recorded on
-   every device; on CPU runs this is the main memory metric).
+4. **CPU peak RSS** — *sampled peak*: `psutil` current RSS read once per
+   batch during the measured run; the reported value is the **maximum of
+   those samples** (a lower bound on the instantaneous true peak between
+   samples — never the process-lifetime OS peak, and never a single
+   end-of-epoch spot check). Recorded on every device; on CPU runs this is
+   the main memory metric.
 5. **GPU peak allocated** — `torch.cuda.max_memory_allocated()` /
    `max_memory_reserved()`, reset before each measured run. Recorded only
    when CUDA is active; **never estimated for CPU runs**.
@@ -95,16 +127,38 @@ For every timed configuration report:
 
 ## 4. Timing protocol
 
+### Definitions (config `benchmark:` section)
+
+| Config key | Meaning |
+|---|---|
+| `warmup_iterations` | number of **training batches** run before each measured unit to warm system state (CUDA kernel/cudnn algorithm selection, GPU allocator caches, DataLoader worker startup, CPU thread pools). **Excluded from every statistic.** |
+| `repeat_runs` | number of **measured units** (default: one training epoch each) aggregated into mean ± std |
+
+Warm-up performs optimizer updates, so it *changes model weights*. A valid
+protocol therefore restores the controlled initial state after warm-up —
+otherwise the CPU and GPU runs (and every repeat) would measure from
+different weights:
+
 ```
-for run in range(repeat_runs):          # default 5
-    for i in range(warmup_iterations):  # default 3 — EXCLUDED from stats
-        train_one_batch(...)
+snapshot = snapshot_run_state(model, optimizer, scheduler)   # §1.1, before anything
+for run in range(repeat_runs):              # each sample starts identically
+    restore_run_state(snapshot, ...)        # model + optimizer + scheduler + RNG
+    for i in range(warmup_iterations):      # system warm-up — EXCLUDED
+        train_one_batch(...)                # weights change HERE
+    restore_run_state(snapshot, ...)        # measured run starts from INITIAL state
     if device is cuda: torch.cuda.synchronize()
+    reset GPU peak-memory stats; start RSS sampling window
     t0 = time.perf_counter()
-    ... one measured epoch / step ...
+    ... one measured unit (epoch / max_batches window) ...
     if device is cuda: torch.cuda.synchronize()
     t1 = time.perf_counter()
+    record sample (t1-t0) + timing buckets + memory + config/weight hashes
 ```
+
+What warm-up warms: kernel/algorithm selection, allocator and cache state,
+worker/thread startup. What it contributes to: **nothing reported** — all
+samples come from runs restored to identical initial state (§1.1), so
+warm-up weight drift can never leak into measured numbers.
 
 ### Timing buckets (no double-counting)
 
@@ -125,9 +179,12 @@ overhead, metric bookkeeping) is reported as `other = end_to_end −
 ### CUDA rules
 
 - `torch.cuda.synchronize()` immediately before every `t0`/`t1` on GPU.
-- Warm-up iterations excluded from all statistics.
+- Warm-up iterations excluded from all statistics (and see state-restore
+  rule above).
 - GPU memory counters reset (`torch.cuda.reset_peak_memory_stats()`) before
-  each measured run.
+  each measured run; CPU RSS sampling window restarts with each run.
+- All run state (model/optimizer/scheduler/RNG) restored from the §1.1
+  snapshot before warm-up **and** before each measured unit.
 
 ---
 
@@ -220,7 +277,8 @@ Experiment D run <id>
 Host: <Colab runtime host, CPU cores, RAM>
 GPU: <model, VRAM, CUDA, torch/tv versions>
 Config hash: <sha256 of configs/experiment.yaml + split seed>
-Epochs: N, batch: B, repeats: R (warmup W)
+Weight hash: <sha256 of the §1.1 initial-state snapshot — must match across compared runs>
+Epochs: N, batch: B, repeats: R (warmup W batches, state-restore)
 
                 CPU          GPU
 train time (s)  x.xx ± y.yy  x.xx ± y.yy
@@ -229,3 +287,27 @@ peak mem        RSS x.x GB   alloc x.x GB
 val mAP@0.5     x.xxx        x.xxx
 speedup (GPU)  = CPU_time / GPU_time = x.xx ×   [only in D]
 ```
+
+---
+
+## 9. Reproducibility checklist (before publishing any table)
+
+- [ ] `config_hash` recorded and identical across all compared runs
+- [ ] `weight_hash` recorded and identical across all compared runs (§1.1)
+- [ ] initial-state snapshot taken **before** any warm-up or training
+- [ ] `restore_run_state` applied before warm-up **and** before each
+      measured unit (state-restore warm-up, §4)
+- [ ] split manifest (seed 42, image lists) identical across runs
+- [ ] DataLoader shuffle order controlled by a dedicated seeded generator
+- [ ] `warmup_iterations` and `repeat_runs` values logged; warm-up samples
+      excluded from every statistic
+- [ ] every repeat recorded as an individual sample (mean ± std computed
+      from the samples, not from a pre-aggregated number)
+- [ ] CUDA: sync before/after timestamps; GPU peak stats reset per unit
+- [ ] CPU: per-batch RSS sampling active; GPU memory fields null
+- [ ] hardware report collected at runtime (no assumed GPU model/VRAM)
+- [ ] speedup only for matched Experiment D pairs
+- [ ] no parallel-efficiency number without a documented scaling study (§3)
+- [ ] detection metrics (mAP) in a separate table from performance (§3)
+- [ ] `dataset.approved` still `false` unless dataset approval is recorded
+- [ ] no dataset files, weights, checkpoints or secrets committed

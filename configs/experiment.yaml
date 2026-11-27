@@ -98,6 +98,9 @@ dataloader:
   num_workers: 2            # Windows: keep >0 only if it proves stable; set 0 if it hangs
   pin_memory: true          # effective only on CUDA; ignored on CPU
   persistent_workers: false
+  # Shuffle order is NOT taken from the global RNG: loaders are built with a
+  # dedicated torch.Generator(seed) so every compared run sees the same data
+  # order (EXPERIMENT_DESIGN §2 / §9 checklist).
 
 # ----------------------------------------------------------------------------
 # Device — selected at RUNTIME, never hard-coded in library code.
@@ -114,11 +117,18 @@ log_dir: logs
 results_dir: results
 
 # ----------------------------------------------------------------------------
-# Benchmarking protocol (see docs/EXPERIMENT_DESIGN.md)
+# Benchmarking protocol (binding: docs/EXPERIMENT_DESIGN.md §4 state-restore
+# warm-up; definitions below — values unchanged, semantics now explicit)
 # ----------------------------------------------------------------------------
 benchmark:
-  warmup_iterations: 3      # excluded from all reported statistics
-  repeat_runs: 5            # report mean + std over these runs
+  # warmup_iterations = TRAINING BATCHES run before each measured unit to warm
+  # system state (CUDA kernels, allocator, workers). EXCLUDED from all stats.
+  # Warm-up changes weights, so the §1.1 initial-state snapshot is restored
+  # after warm-up and again before every measured unit.
+  warmup_iterations: 3
+  # repeat_runs = MEASURED UNITS (one training epoch each by default);
+  # every sample starts from the same restored snapshot; report mean + std.
+  repeat_runs: 5
   synchronize_cuda: true    # torch.cuda.synchronize() around GPU timers
   # Timing buckets are measured so they do NOT double-count:
   #   data_loading  — time inside the DataLoader iterator (CPU)
