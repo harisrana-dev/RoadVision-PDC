@@ -23,6 +23,7 @@ warm-up iterations are excluded from all reported statistics.
 from __future__ import annotations
 
 import logging
+import math
 import time
 from contextlib import contextmanager
 from dataclasses import dataclass, field
@@ -74,6 +75,8 @@ class EpochReport:
     loss_mean: float = float("nan")
     loss_std: float = float("nan")
     throughput_img_s: float = float("nan")
+    # Max of per-batch current-RSS samples during this epoch (sampled peak —
+    # a lower bound on the instantaneous true peak; see EXPERIMENT_DESIGN §3).
     peak_cpu_rss_mb: float = float("nan")
     peak_gpu_alloc_mb: float | None = None    # None on CPU runs
     peak_gpu_reserved_mb: float | None = None
@@ -85,8 +88,8 @@ class EpochReport:
         return d
 
 
-def _peak_rss_mb() -> float:
-    """Peak resident set size of this process in MB (None-safe on all OS)."""
+def _current_rss_mb() -> float:
+    """Current resident set size of this process in MB (None-safe on all OS)."""
     try:
         import psutil
 
@@ -130,7 +133,8 @@ def train_one_epoch(
     if device.type == "cuda":
         torch.cuda.reset_peak_memory_stats(device)
 
-    # ---- optional RSS sampling thread-free approach: sample per batch ----
+    # ---- CPU memory: sample current RSS every batch, report the max ----
+    rss_peak = _current_rss_mb()
     losses: list[float] = []
 
     # Warm timing buckets
@@ -184,6 +188,9 @@ def train_one_epoch(
         compute_dt = (t5 - t4) if collect_timing else 0.0
 
         losses.append(float(loss.detach()))
+        rss_sample = _current_rss_mb()
+        if not math.isnan(rss_sample):
+            rss_peak = rss_sample if math.isnan(rss_peak) else max(rss_peak, rss_sample)
         t_data += data_dt
         t_xfer += xfer_dt
         t_compute += compute_dt
@@ -204,7 +211,7 @@ def train_one_epoch(
         report.loss_history = losses
     if report.end_to_end > 0:
         report.throughput_img_s = report.images / report.end_to_end
-    report.peak_cpu_rss_mb = _peak_rss_mb()
+    report.peak_cpu_rss_mb = rss_peak
     if device.type == "cuda":
         report.peak_gpu_alloc_mb = torch.cuda.max_memory_allocated(device) / (1 << 20)
         report.peak_gpu_reserved_mb = torch.cuda.max_memory_reserved(device) / (1 << 20)
