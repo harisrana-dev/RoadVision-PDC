@@ -27,6 +27,7 @@ import math
 import time
 from contextlib import contextmanager
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Iterator
 
 import torch
@@ -103,6 +104,33 @@ def _sync(device: torch.device) -> None:
         torch.cuda.synchronize()
 
 
+def _ensure_model_device(model: nn.Module, device: torch.device) -> None:
+    """Fail fast with an actionable error when model and device disagree.
+
+    The engine never moves the model implicitly (``run_training`` does that
+    once, explicitly); a mismatch deep inside torchvision would otherwise
+    surface as an opaque device RuntimeError.
+    """
+    if device.type == "cuda" and not torch.cuda.is_available():
+        raise RuntimeError(
+            "device=cuda requested but CUDA is not available on this host. "
+            "Use device=cpu here, or run on a CUDA-enabled machine (Colab GPU)."
+        )
+    try:
+        param_device = next(model.parameters()).device
+    except StopIteration:
+        return  # no parameters — nothing to place
+    mismatch = param_device.type != device.type or (
+        device.index is not None and param_device.index != device.index
+    )
+    if mismatch:
+        raise RuntimeError(
+            f"Model parameters are on '{param_device}' but the training device "
+            f"is '{device}'. Call model.to(device) first "
+            "(run_training does this automatically)."
+        )
+
+
 # ---------------------------------------------------------------------------
 # Single training epoch
 # ---------------------------------------------------------------------------
@@ -127,6 +155,7 @@ def train_one_epoch(
     collect_timing:
         When False, only loss is tracked (cheaper; used for pure loss curves).
     """
+    _ensure_model_device(model, device)
     model.train()
     report = EpochReport(device=str(device))
 
@@ -249,6 +278,7 @@ def evaluate_timed(
     max_batches: int | None = None,
 ) -> EvalReport:
     """Timed validation/inference pass (no gradients, same bucket rules)."""
+    _ensure_model_device(model, device)
     model.eval()
     report = EvalReport(device=str(device))
     if device.type == "cuda":
@@ -258,10 +288,9 @@ def evaluate_timed(
     t_start = time.perf_counter()
 
     iterator = iter(data_loader)
+    batches_done = 0
     while True:
-        if max_batches is not None and report.images >= max_batches * max(
-            1, data_loader.batch_size or 1
-        ):
+        if max_batches is not None and batches_done >= max_batches:
             break
         t0 = time.perf_counter()
         try:
@@ -285,6 +314,7 @@ def evaluate_timed(
         t5 = time.perf_counter()
         t_infer += t5 - t4
         report.images += len(images)
+        batches_done += 1
 
     report.end_to_end = time.perf_counter() - t_start
     report.data_loading = t_data
@@ -352,12 +382,17 @@ def run_training(
     CPU and GPU experiments both call this function; only ``device``
     differs. Returns a history dict (epoch reports + validation reports).
     """
+    if device.type == "cuda" and not torch.cuda.is_available():
+        raise RuntimeError(
+            "device=cuda requested but CUDA is not available on this host. "
+            "Use device=cpu here, or run on a CUDA-enabled machine (Colab GPU)."
+        )
+    model.to(device)  # place first; optimizer/scheduler then reference on-device params
     optimizer = build_optimizer(model, config)
     scheduler = build_scheduler(optimizer, config)
     n_epochs = int(epochs if epochs is not None else config["training"]["epochs"])
     grad_clip = config["training"].get("grad_clip_norm")
 
-    model.to(device)
     history: dict[str, Any] = {"device": str(device), "epochs": []}
 
     for epoch in range(n_epochs):
@@ -396,3 +431,82 @@ def run_training(
             on_epoch_end(epoch, entry)
 
     return history
+
+
+# ---------------------------------------------------------------------------
+# Checkpointing (full training resume; controlled-state support per
+# docs/EXPERIMENT_DESIGN.md §1.1/§4)
+# ---------------------------------------------------------------------------
+
+def save_checkpoint(
+    path: str | Path,
+    model: nn.Module,
+    optimizer: torch.optim.Optimizer | None = None,
+    scheduler: Any | None = None,
+    *,
+    epoch: int = 0,
+    extra: dict[str, Any] | None = None,
+) -> None:
+    """Persist a full training checkpoint (model + optimizer + scheduler).
+
+    ``optimizer``/``scheduler`` are stored whenever given so a later
+    :func:`load_checkpoint` can resume exactly — momentum buffers, LR
+    counters and the epoch number are never dropped on save.
+    """
+    payload: dict[str, Any] = {
+        "model": model.state_dict(),
+        "optimizer": optimizer.state_dict() if optimizer is not None else None,
+        "scheduler": scheduler.state_dict() if scheduler is not None else None,
+        "epoch": int(epoch),
+        "extra": dict(extra or {}),
+    }
+    ckpt_path = Path(path)
+    ckpt_path.parent.mkdir(parents=True, exist_ok=True)
+    torch.save(payload, ckpt_path)
+
+
+def load_checkpoint(
+    path: str | Path,
+    model: nn.Module,
+    optimizer: torch.optim.Optimizer | None = None,
+    scheduler: Any | None = None,
+    *,
+    strict: bool = True,
+) -> dict[str, Any]:
+    """Restore a checkpoint written by :func:`save_checkpoint`.
+
+    When the caller passes an optimizer/scheduler, the checkpoint MUST
+    contain that state: a full training resume never silently omits
+    optimizer momentum, scheduler counters or the epoch number. A
+    weights-only restore is explicit — call with ``optimizer=None`` and
+    ``scheduler=None``.
+
+    Returns ``{"epoch": int, "extra": dict}`` from the payload.
+    """
+    # Our own local checkpoint format (tensors + plain containers) —
+    # weights_only=False is required for the nested optimizer/scheduler
+    # dicts on torch>=2.6; only ever load files written by save_checkpoint.
+    payload = torch.load(Path(path), map_location="cpu", weights_only=False)
+    model.load_state_dict(payload["model"], strict=strict)
+
+    ckpt_opt = payload.get("optimizer")
+    if optimizer is not None:
+        if ckpt_opt is None:
+            raise ValueError(
+                f"Checkpoint '{path}' has no optimizer state; a full resume must "
+                "restore it. Re-save via save_checkpoint(..., optimizer=...) or "
+                "load with optimizer=None for an explicit weights-only restore."
+            )
+        optimizer.load_state_dict(ckpt_opt)
+
+    ckpt_sched = payload.get("scheduler")
+    if scheduler is not None:
+        if ckpt_sched is None:
+            raise ValueError(
+                f"Checkpoint '{path}' has no scheduler state; a full resume must "
+                "restore it. Re-save via save_checkpoint(..., scheduler=...) or "
+                "load with scheduler=None."
+            )
+        scheduler.load_state_dict(ckpt_sched)
+
+    return {"epoch": int(payload.get("epoch", 0)), "extra": payload.get("extra", {})}

@@ -8,10 +8,13 @@ import pytest
 import torch
 
 from roadvision.engine.train import (
+    _ensure_model_device,
     build_optimizer,
     build_scheduler,
     evaluate_timed,
+    load_checkpoint,
     run_training,
+    save_checkpoint,
     train_one_epoch,
 )
 from roadvision.models.detector import (
@@ -225,3 +228,192 @@ def test_cuda_only_if_available(model_config: dict):
     opt.step()
     torch.cuda.synchronize()
     assert torch.isfinite(loss)
+
+
+# ---------------------------------------------------------------------------
+# Shared-engine hardening (device placement, edge cases, checkpoints)
+# ---------------------------------------------------------------------------
+
+def test_optimizer_updates_parameters(model_config: dict):
+    model = build_detector(model_config)
+    opt = build_optimizer(model, model_config)
+    before = [p.detach().clone() for p in model.parameters()]
+
+    class _Loader:
+        batch_size = 2
+
+        def __iter__(self):
+            yield make_synthetic_batch(batch_size=2, seed=11)
+
+    train_one_epoch(model, opt, _Loader(), torch.device("cpu"), epoch=0, max_batches=1)
+    assert any(
+        not torch.equal(a, b) for a, b in zip(before, model.parameters())
+    ), "optimizer step must actually update parameters"
+
+
+def test_device_check_cuda_unavailable_raises(model_config: dict, monkeypatch):
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    model = build_detector(model_config)
+    with pytest.raises(RuntimeError, match="CUDA is not available"):
+        _ensure_model_device(model, torch.device("cuda"))
+
+
+def test_device_check_mismatch_raises(model_config: dict, monkeypatch):
+    # Pretend CUDA exists so the mismatch branch is reachable on a CPU-only host;
+    # only device-type bookkeeping runs — no CUDA API is touched.
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    model = build_detector(model_config)  # parameters on cpu
+    with pytest.raises(RuntimeError, match="Model parameters are on 'cpu'"):
+        _ensure_model_device(model, torch.device("cuda"))
+
+
+def test_train_one_epoch_device_guard(model_config: dict, monkeypatch):
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    model = build_detector(model_config)
+    opt = build_optimizer(model, model_config)
+
+    class _Loader:
+        batch_size = 2
+
+        def __iter__(self):
+            yield make_synthetic_batch(batch_size=2, seed=12)
+
+    with pytest.raises(RuntimeError, match="Model parameters are on"):
+        train_one_epoch(model, opt, _Loader(), torch.device("cuda"))
+
+
+def test_run_training_cuda_unavailable_raises(model_config: dict):
+    if torch.cuda.is_available():
+        pytest.skip("CUDA present; unavailability branch not reachable here")
+    model = build_detector(model_config)
+
+    class _Loader:
+        batch_size = 2
+
+        def __iter__(self):
+            yield make_synthetic_batch(batch_size=2, seed=13)
+
+    with pytest.raises(RuntimeError, match="CUDA is not available"):
+        run_training(model, _Loader(), model_config, torch.device("cuda"), epochs=1)
+
+
+def test_train_one_epoch_empty_loader(model_config: dict):
+    model = build_detector(model_config)
+    opt = build_optimizer(model, model_config)
+
+    class _Empty:
+        batch_size = 2
+
+        def __iter__(self):
+            return iter(())
+
+    report = train_one_epoch(model, opt, _Empty(), torch.device("cpu"))
+    assert report.images == 0
+    assert math.isnan(report.loss_mean)  # no data → no fabricated stats
+    assert report.end_to_end > 0
+
+
+def test_train_max_batches_counts_batches(model_config: dict):
+    model = build_detector(model_config)
+    opt = build_optimizer(model, model_config)
+
+    class _Loader:
+        batch_size = 2
+
+        def __iter__(self):
+            for _ in range(5):
+                yield make_synthetic_batch(batch_size=2, seed=14)
+
+    report = train_one_epoch(
+        model, opt, _Loader(), torch.device("cpu"), max_batches=2
+    )
+    assert report.images == 4  # exactly 2 batches of 2
+
+
+def test_eval_max_batches_counts_batches_not_images(model_config: dict):
+    """Unequal batch sizes: max_batches=2 must stop after 2 batches (3 images)."""
+    model = build_detector(model_config)
+
+    class _Loader:
+        batch_size = 2
+
+        def __iter__(self):
+            for i, size in enumerate((2, 1, 1)):
+                yield make_synthetic_batch(batch_size=size, seed=15 + i)
+
+    rep = evaluate_timed(model, _Loader(), torch.device("cpu"), max_batches=2)
+    assert rep.images == 3  # 2 + 1; the third batch must NOT run
+
+
+def test_checkpoint_roundtrip_restores_full_state(tmp_path, model_config: dict):
+    model = build_detector(model_config)
+    opt = build_optimizer(model, model_config)
+    sched = build_scheduler(opt, model_config)
+    # populate optimizer momentum + scheduler counters
+    images, targets = make_synthetic_batch(batch_size=2, seed=16)
+    loss = sum(model(images, targets).values())
+    opt.zero_grad(set_to_none=True)
+    loss.backward()
+    opt.step()
+    sched.step()
+
+    path = tmp_path / "ckpt.pt"
+    save_checkpoint(path, model, opt, sched, epoch=3, extra={"note": "roundtrip"})
+
+    model2 = build_detector(model_config)
+    opt2 = build_optimizer(model2, model_config)
+    sched2 = build_scheduler(opt2, model_config)
+    meta = load_checkpoint(path, model2, opt2, sched2)
+
+    assert meta["epoch"] == 3
+    assert meta["extra"]["note"] == "roundtrip"
+    for k, v in model.state_dict().items():
+        assert torch.equal(v, model2.state_dict()[k]), k
+    s1, s2 = opt.state_dict(), opt2.state_dict()
+    for pid, state in s1["state"].items():
+        for key, val in state.items():
+            if torch.is_tensor(val):
+                assert torch.equal(val, s2["state"][pid][key]), (pid, key)
+    assert sched2.state_dict()["last_epoch"] == sched.state_dict()["last_epoch"]
+
+
+def test_checkpoint_missing_optimizer_raises(tmp_path, model_config: dict):
+    model = build_detector(model_config)
+    path = tmp_path / "weights_only.pt"
+    save_checkpoint(path, model)  # no optimizer stored
+    opt = build_optimizer(model, model_config)
+    with pytest.raises(ValueError, match="no optimizer state"):
+        load_checkpoint(path, model, opt)
+    # explicit weights-only restore is allowed and returns the epoch
+    meta = load_checkpoint(path, model)
+    assert meta["epoch"] == 0
+
+
+def test_checkpoint_missing_scheduler_raises(tmp_path, model_config: dict):
+    model = build_detector(model_config)
+    opt = build_optimizer(model, model_config)
+    path = tmp_path / "no_scheduler.pt"
+    save_checkpoint(path, model, opt)  # scheduler omitted
+    sched = build_scheduler(opt, model_config)
+    with pytest.raises(ValueError, match="no scheduler state"):
+        load_checkpoint(path, model, opt, sched)
+
+
+def test_train_one_epoch_cuda_engine(model_config: dict):
+    """Full engine epoch on GPU — conditional test (skips on the laptop)."""
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA not available on this host (expected locally)")
+    model = build_detector(model_config).cuda()
+    opt = build_optimizer(model, model_config)
+
+    class _Loader:
+        batch_size = 2
+
+        def __iter__(self):
+            yield make_synthetic_batch(batch_size=2, seed=17)
+
+    report = train_one_epoch(model, opt, _Loader(), torch.device("cuda"), epoch=0)
+    assert report.device.startswith("cuda")
+    assert report.transfer >= 0
+    assert report.peak_gpu_alloc_mb is not None
+    assert math.isfinite(report.loss_mean)
